@@ -3,9 +3,11 @@ package resource
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -25,6 +27,7 @@ const (
 	pluginMountPath      = "/var/lib/kubelet/device-plugins"
 	pluginEndpointPrefix = "nics"
 	resourceName         = "pci/nics"
+	name                 = "pci network device manager"
 )
 
 type NicsManager struct {
@@ -149,13 +152,13 @@ func (nm *NicsManager) DiscoverNetworks() error {
 	return nil
 }
 
-// Discovers capabable network devices
-func (nm *NicsManager) Start() error {
+// Serve starts the gRPC server of the device plugin.
+func (nm *NicsManager) Serve() error {
 	pluginEndpoint := filepath.Join(pluginMountPath, nm.socketFile)
-	glog.Infof("Starting PCI Network Device Plugin server at: %s\n", pluginEndpoint)
-	lis, err := net.Listen("unix", pluginEndpoint)
+	os.Remove(pluginEndpoint)
+	sock, err := net.Listen("unix", pluginEndpoint)
 	if err != nil {
-		glog.Errorf("Error. Starting PCI Network Device Plugin server failed: %v", err)
+		return err
 	}
 	nm.grpcServer = grpc.NewServer()
 
@@ -163,26 +166,110 @@ func (nm *NicsManager) Start() error {
 	registerapi.RegisterRegistrationServer(nm.grpcServer, nm)
 	pluginapi.RegisterDevicePluginServer(nm.grpcServer, nm)
 
-	go nm.grpcServer.Serve(lis)
+	go func() {
+		lastCrashTime := time.Now()
+		restartCount := 0
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		for {
+			// quite if it has been restarted too often
+			// i.e. if server has crashed more than 5 times and it didn't last more than one hour each time
+			if restartCount > 5 {
+				// quit
+				glog.Fatalf("GRPC server for '%s' has repeatedly crashed recently. Quitting", name)
+			}
+
+			glog.Infof("Starting GRPC server for '%s'", name)
+			err := nm.grpcServer.Serve(sock)
+			if err == nil {
+				break
+			}
+
+			glog.Infof("GRPC server for '%s' crashed with error: %v", name, err)
+
+			timeSinceLastCrash := time.Since(lastCrashTime).Seconds()
+			lastCrashTime = time.Now()
+			if timeSinceLastCrash > 3600 {
+				// it has been one hour since the last crash.. reset the count to reflect on the frequency
+				restartCount = 0
+			} else {
+				restartCount++
+			}
+		}
+	}()
+
+	// Wait for server to start by launching a blocking connection
+	conn, err := nm.dial(pluginEndpoint, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	conn.Close()
+
+	return nil
+}
+
+// Discovers capabable network devices
+func (nm *NicsManager) Start() error {
+	err := nm.Serve()
+	if err != nil {
+		glog.Infof("Could not start device plugin for '%s': %s", name, err)
+		nm.cleanup()
+		return err
+	}
+	glog.Infof("Starting to serve '%s' on %s", name, nm.socketFile)
+
+	err = nm.Register()
+	if err != nil {
+		glog.Infof("Could not register device plugin: %s", err)
+		return errors.Join(err, nm.Stop())
+	}
+	glog.Infof("Registered device plugin for '%s' with Kubelet", name)
+
+	return nil
+}
+
+// dial establishes the gRPC communication with the registered device plugin.
+func (nm *NicsManager) dial(unixSocketPath string, timeout time.Duration) (*grpc.ClientConn, error) {
+	ctx, cancel := context.WithTimeout(context.TODO(), timeout)
 	defer cancel()
 
 	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
 		return net.Dial("unix", addr)
 	}
 
-	// Wait for server to start by launching a blocking connection
-	conn, err := grpc.DialContext(ctx, pluginEndpoint, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock(),
+	conn, err := grpc.DialContext(ctx, unixSocketPath,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
 		grpc.WithContextDialer(dialer),
 	)
-
 	if err != nil {
-		glog.Errorf("Error. Could not establish connection with gRPC server: %v", err)
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+// Register registers the device plugin for the given resourceName with Kubelet.
+func (nm *NicsManager) Register() error {
+	conn, err := nm.dial(pluginapi.KubeletSocket, 5*time.Second)
+	if err != nil {
 		return err
 	}
-	glog.Infoln("PCI Network Device Plugin server started serving")
-	conn.Close()
+	defer conn.Close()
+
+	client := pluginapi.NewRegistrationClient(conn)
+	reqt := &pluginapi.RegisterRequest{
+		Version:      pluginapi.Version,
+		Endpoint:     path.Base(nm.socketFile),
+		ResourceName: string(resourceName),
+		Options: &pluginapi.DevicePluginOptions{
+			GetPreferredAllocationAvailable: true,
+		},
+	}
+
+	_, err = client.Register(context.Background(), reqt)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
