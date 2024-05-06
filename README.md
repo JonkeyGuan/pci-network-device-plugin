@@ -1,4 +1,7 @@
 # pci-network-device-plugin
 
-arch -x86_64 /bin/zsh
-go mod vendor
+switch arch type from M1  
+```arch -x86_64 /bin/zsh```
+
+update offline vendor  
+```go mod vendor```
