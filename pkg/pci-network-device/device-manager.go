@@ -22,7 +22,7 @@ const (
 	routePath    = "/proc/net/route"
 
 	// Device plugin settings.
-	pluginMountPath      = "/var/lib/kubelet/plugins"
+	pluginMountPath      = "/var/lib/kubelet/device-plugins"
 	pluginEndpointPrefix = "nics"
 	resourceName         = "pci/nics"
 )
