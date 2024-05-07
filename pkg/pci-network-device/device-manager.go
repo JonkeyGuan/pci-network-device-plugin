@@ -333,7 +333,7 @@ func (nm *NicsManager) Allocate(ctx context.Context, rqt *pluginapi.AllocateRequ
 
 		glog.Infof("PCI Addrs allocated: %s", pciAddrs)
 		envmap := make(map[string]string)
-		envmap["PCI_RESOURCE_NICS"] = pciAddrs
+		envmap["PCI_RESOURCE_PCI_NICS"] = pciAddrs
 
 		containerResp.Envs = envmap
 		resp.ContainerResponses = append(resp.ContainerResponses, containerResp)
